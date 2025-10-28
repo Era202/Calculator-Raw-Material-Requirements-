@@ -4,6 +4,10 @@ from collections import defaultdict
 from functools import lru_cache
 import streamlit as st
 import io
+import datetime
+from io import BytesIO
+import calendar
+import plotly.express as px
 
 # Configure the page
 st.set_page_config(page_title="MRP_Calculator Raw Material Requirements ", page_icon="📊", layout="wide")
@@ -22,6 +26,7 @@ class MRPCalculator:
         self.material_uoms = {}  # تخزين وحدات القياس للمواد
         self.standardized_uoms = {}  # تخزين الوحدات الموحدة
         self.mrp_control_values = {}  # تخزين قيم MRP Contor
+        self.manufacturing_quantities = {}  # كميات التصنيع للمكونات الوسيطة
         
     def load_data(self, uploaded_file) -> bool:
         """Load Plan, BOM and MRP Control sheets from uploaded Excel file"""
@@ -364,6 +369,147 @@ class MRPCalculator:
         
         return out_df
 
+    def calculate_manufacturing_quantities(self):
+        """حساب كميات التصنيع للمكونات الوسيطة تلقائياً"""
+        try:
+            # حساب كميات التصنيع من الخطة للمواد الموجودة في BOM كمواد أب
+            for material in self.relations.keys():
+                if material in self.plan_df.iloc[:, 0].values:
+                    material_plan = self.plan_df[self.plan_df.iloc[:, 0] == material]
+                    if not material_plan.empty:
+                        # جمع جميع الكميات من أعمدة الشهور
+                        month_cols = self.plan_df.columns[2:] if "Material Description" in self.plan_df.columns else self.plan_df.columns[1:]
+                        total_manufacturing = material_plan[month_cols].sum().sum()
+                        if total_manufacturing > 0:
+                            self.manufacturing_quantities[material] = total_manufacturing
+            
+            st.info(f"✅ تم حساب كميات التصنيع لـ {len(self.manufacturing_quantities)} مكون وسيط")
+            return True
+        except Exception as e:
+            st.warning(f"⚠️ خطأ في حساب كميات التصنيع: {e}")
+            return False
+
+    def generate_bom_level1_sheet(self):
+        """إنشاء شيت للمكونات الموجودة في المستوى الأول فقط مع الكميات المطلوبة حسب التاريخ"""
+        try:
+            # تحديد أعمدة الشهور من الخطة
+            month_cols = self.plan_df.columns[2:] if "Material Description" in self.plan_df.columns else self.plan_df.columns[1:]
+            
+            # تحديد المكونات في المستوى الأول (التي تظهر كأبناء للمواد في الخطة)
+            plan_materials = set(self.plan_df.iloc[:, 0].astype(str).str.strip())
+            level1_components = set()
+            
+            # جمع جميع المكونات من المستوى الأول
+            for parent in plan_materials:
+                if parent in self.relations:
+                    for comp, qty in self.relations[parent]:
+                        level1_components.add(comp)
+            
+            # حساب الكميات المطلوبة لكل مكون حسب التاريخ
+            component_requirements = defaultdict(lambda: defaultdict(float))
+            
+            for _, row in self.plan_df.iterrows():
+                parent = str(row.iloc[0]).strip()
+                if not parent or parent not in self.relations:
+                    continue
+                    
+                # الحصول على مكونات المستوى الأول لهذا الأب
+                for comp, comp_qty in self.relations[parent]:
+                    for month in month_cols:
+                        try:
+                            planned_qty = row[month]
+                            if pd.isna(planned_qty):
+                                continue
+                            planned = float(str(planned_qty).replace(",", "."))
+                            if planned > 0:
+                                component_requirements[comp][month] += planned * comp_qty
+                        except (ValueError, TypeError):
+                            continue
+            
+            # إنشاء DataFrame للمستوى الأول مع الكميات
+            level1_data = []
+            for comp in sorted(level1_components):
+                row_data = {
+                    'Component_Code': comp,
+                    'Component_Description': self.get_material_description(comp),
+                    'Standardized_UoM': self.get_standardized_uom(comp),
+                    'MRP_Contor': self.get_mrp_control_value(comp),
+                    'Is_Raw_Material': comp.startswith("1") or comp not in self.relations or not self.relations[comp],
+                    'Total_Required': sum(component_requirements[comp].values())
+                }
+                
+                # إضافة الكميات لكل شهر
+                for month in month_cols:
+                    row_data[str(month)] = component_requirements[comp].get(month, 0.0)
+                
+                level1_data.append(row_data)
+            
+            level1_df = pd.DataFrame(level1_data)
+            
+            # إعادة ترتيب الأعمدة لجعل الكميات الشهرية بعد الأعمدة الأساسية
+            base_cols = ['Component_Code', 'Component_Description', 'Standardized_UoM', 'MRP_Contor', 'Is_Raw_Material', 'Total_Required']
+            month_cols_sorted = [str(col) for col in month_cols]
+            all_cols = base_cols + month_cols_sorted
+            
+            level1_df = level1_df[all_cols]
+            
+            st.info(f"✅ تم تحديد {len(level1_df)} مكون في المستوى الأول مع الكميات المطلوبة")
+            return level1_df
+            
+        except Exception as e:
+            st.error(f"❌ خطأ في إنشاء شيت المستوى الأول: {e}")
+            return pd.DataFrame()
+
+    def create_monthly_summary(self):
+        """إنشاء ملخص شهري للكميات حسب نوع الأمر"""
+        try:
+            if "Order Type" not in self.plan_df.columns:
+                st.warning("⚠️ عمود 'Order Type' غير موجود في شيت Plan")
+                return pd.DataFrame()
+            
+            # تحديد أعمدة الشهور
+            date_cols = [c for c in self.plan_df.columns if isinstance(c, (datetime.datetime, pd.Timestamp))]
+            if not date_cols:
+                # إذا لم تكن هناك تواريخ، استخدم الأعمدة الرقمية بعد العمودين الأولين
+                date_cols = self.plan_df.columns[2:] if "Material Description" in self.plan_df.columns else self.plan_df.columns[1:]
+            
+            orders_summary = self.plan_df.melt(
+                id_vars=["Material", "Order Type"],
+                value_vars=date_cols,
+                var_name="Month",
+                value_name="Quantity"
+            )
+            
+            # تحويل الشهور إلى أسماء إذا كانت تواريخ
+            try:
+                orders_summary["Month"] = pd.to_datetime(orders_summary["Month"], errors="coerce")
+                orders_summary = orders_summary.dropna(subset=["Month"])
+                orders_summary["Month"] = orders_summary["Month"].dt.month_name()
+            except:
+                pass  # إذا لم تكن تواريخ، استخدم الأسماء كما هي
+
+            orders_grouped = orders_summary.groupby(
+                ["Month", "Order Type"]
+            ).agg({"Quantity": "sum"}).reset_index()
+
+            pivot_df = orders_grouped.pivot_table(
+                index="Month", columns="Order Type", values="Quantity", aggfunc="sum", fill_value=0
+            ).reset_index()
+
+            pivot_df["الإجمالي"] = pivot_df.sum(axis=1, numeric_only=True)
+            
+            # حساب النسب المئوية
+            if 'E' in pivot_df.columns:
+                pivot_df["E%"] = (pivot_df["E"] / pivot_df["الإجمالي"] * 100).round(1).astype(str) + "%"
+            if 'L' in pivot_df.columns:
+                pivot_df["L%"] = (pivot_df["L"] / pivot_df["الإجمالي"] * 100).round(1).astype(str) + "%"
+            
+            return pivot_df
+            
+        except Exception as e:
+            st.error(f"❌ خطأ في إنشاء الملخص الشهري: {e}")
+            return pd.DataFrame()
+
     def run(self):
         """Main execution method"""
         # File upload section
@@ -442,10 +588,33 @@ class MRPCalculator:
                     if len(self.material_descriptions) > 10:
                         st.info(f"... وعرض {len(self.material_descriptions) - 10} مادة أخرى")
                 
+                # Calculate manufacturing quantities
+                self.calculate_manufacturing_quantities()
+                
+                # Show manufacturing quantities
+                if self.manufacturing_quantities:
+                    st.subheader("🏭 كميات التصنيع للمكونات الوسيطة")
+                    manuf_data = []
+                    for material, qty in list(self.manufacturing_quantities.items())[:10]:
+                        manuf_data.append({
+                            'المادة': material,
+                            'الوصف': self.get_material_description(material),
+                            'كمية التصنيع': f"{qty:,.0f}",
+                            'MRP Contor': self.get_mrp_control_value(material)
+                        })
+                    if manuf_data:
+                        manuf_df = pd.DataFrame(manuf_data)
+                        st.dataframe(manuf_df, use_container_width=True)
+                    
+                    if len(self.manufacturing_quantities) > 10:
+                        st.info(f"... وعرض {len(self.manufacturing_quantities) - 10} مكون آخر")
+                
                 # Calculate requirements
                 if st.button("🚀 حساب متطلبات المواد", type="primary"):
                     with st.spinner("جاري حساب متطلبات المواد..."):
                         requirements_df = self.calculate_requirements()
+                        level1_df = self.generate_bom_level1_sheet()
+                        monthly_summary = self.create_monthly_summary()
                     
                     # Display results
                     st.header("📊 نتائج متطلبات المواد")
@@ -465,15 +634,74 @@ class MRPCalculator:
                         st.metric("مواد ذات MRP Contor", f"{materials_with_mrp}/{len(requirements_df)}")
                     
                     # عرض البيانات مع التنسيق
+                    st.subheader("متطلبات المواد الخام")
                     st.dataframe(requirements_df, use_container_width=True)
                     
+                    # عرض مكونات المستوى الأول مع الكميات
+                    if not level1_df.empty:
+                        st.subheader("📋 المكونات في المستوى الأول مع الكميات المطلوبة")
+                        
+                        # إحصائيات سريعة للمستوى الأول
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("عدد المكونات", len(level1_df))
+                        with col2:
+                            total_level1 = level1_df['Total_Required'].sum()
+                            st.metric("إجمالي الكميات", f"{total_level1:,.0f}")
+                        with col3:
+                            raw_materials = level1_df['Is_Raw_Material'].sum()
+                            st.metric("مواد خام", raw_materials)
+                        with col4:
+                            manufactured = len(level1_df) - raw_materials
+                            st.metric("مكونات مصنعة", manufactured)
+                        
+                        st.dataframe(level1_df, use_container_width=True)
+                    
+                    # عرض الملخص الشهري
+                    if not monthly_summary.empty:
+                        st.subheader("📅 الملخص الشهري للكميات")
+                        
+                        # عرض كجدول HTML منسق
+                        html_table = "<table border='1' style='border-collapse: collapse; width:100%; text-align:center; color:black;'>"
+                        html_table += "<tr style='background-color:#d9d9d9; color:blue;'><th>الشهر</th><th>E</th><th>L</th><th>الإجمالي</th><th>E%</th><th>L%</th></tr>"
+
+                        for idx, row in monthly_summary.iterrows():
+                            bg_color = "#f2f2f2" if idx % 2 == 0 else "#ffffff"
+                            html_table += f"<tr style='background-color:{bg_color};'>"
+                            html_table += f"<td style='color:blue;'>{row['Month']}</td>"
+                            html_table += f"<td>{int(row.get('E',0))}</td>"
+                            html_table += f"<td>{int(row.get('L',0))}</td>"
+                            html_table += f"<td>{int(row.get('الإجمالي',0))}</td>"
+                            html_table += f"<td>{row.get('E%','')}</td>"
+                            html_table += f"<td>{row.get('L%','')}</td>"
+                            html_table += "</tr>"
+
+                        html_table += "</table>"
+                        st.markdown(f"<div style='direction:rtl;'>{html_table}</div>", unsafe_allow_html=True)
+                        
+                        # رسم بياني
+                        st.subheader("📊 رسم بياني للكميات الشهرية")
+                        numeric_cols = [c for c in monthly_summary.columns if c not in ["Month", "الإجمالي", "E%", "L%"]]
+                        monthly_summary[numeric_cols] = monthly_summary[numeric_cols].apply(pd.to_numeric, errors="coerce")
+                        
+                        fig = px.bar(
+                            monthly_summary,
+                            x="Month",
+                            y=numeric_cols,
+                            barmode="group",
+                            text_auto=True,
+                            title="توزيع الكميات حسب نوع الأمر",
+                            template="streamlit"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
                     # تحميل النتائج
-                    self.download_results(requirements_df)
+                    self.download_results(requirements_df, level1_df, monthly_summary)
                     
             except Exception as e:
                 st.error(f"❌ حدث خطأ غير متوقع: {e}")
 
-    def download_results(self, requirements_df):
+    def download_results(self, requirements_df, level1_df, monthly_summary):
         """Handle downloading results"""
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -482,6 +710,25 @@ class MRPCalculator:
             if self.mrp_control_df is not None:
                 self.mrp_control_df.to_excel(writer, sheet_name="MRP_Contor", index=False)
             requirements_df.to_excel(writer, sheet_name="RawMaterial_Requirements", index=False)
+            
+            # إضافة الشيتات الجديدة
+            if not level1_df.empty:
+                level1_df.to_excel(writer, sheet_name="Level1_Components", index=False)
+            if not monthly_summary.empty:
+                monthly_summary.to_excel(writer, sheet_name="Monthly_Summary", index=False)
+            
+            # إضافة شيت كميات التصنيع
+            if self.manufacturing_quantities:
+                manuf_df = pd.DataFrame([
+                    {
+                        'Material': mat,
+                        'Description': self.get_material_description(mat),
+                        'Manufacturing_Quantity': qty,
+                        'MRP_Contor': self.get_mrp_control_value(mat)
+                    }
+                    for mat, qty in self.manufacturing_quantities.items()
+                ])
+                manuf_df.to_excel(writer, sheet_name="Manufacturing_Quantities", index=False)
         
         output.seek(0)
         
