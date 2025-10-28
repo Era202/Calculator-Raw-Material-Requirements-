@@ -17,33 +17,101 @@ class MRPCalculator:
         self.relations = defaultdict(list)
         self.plan_df = None
         self.bom_df = None
+        self.mrp_control_df = None
         self.material_descriptions = {}  # تخزين أوصاف المواد
         self.material_uoms = {}  # تخزين وحدات القياس للمواد
         self.standardized_uoms = {}  # تخزين الوحدات الموحدة
+        self.mrp_control_values = {}  # تخزين قيم MRP Contor
         
     def load_data(self, uploaded_file) -> bool:
-        """Load Plan and BOM sheets from uploaded Excel file"""
+        """Load Plan, BOM and MRP Control sheets from uploaded Excel file"""
         try:
             # Read Excel file
             excel_file = pd.ExcelFile(uploaded_file)
             
             # Check if required sheets exist
-            if "Plan" not in excel_file.sheet_names:
-                st.error("❌ شيت 'Plan' غير موجود في الملف")
-                return False
-            if "BOM" not in excel_file.sheet_names:
-                st.error("❌ شيت 'BOM' غير موجود في الملف")
+            required_sheets = ["Plan", "BOM"]
+            missing_sheets = [sheet for sheet in required_sheets if sheet not in excel_file.sheet_names]
+            
+            if missing_sheets:
+                st.error(f"❌ الشيتات التالية غير موجودة في الملف: {', '.join(missing_sheets)}")
                 return False
             
             self.plan_df = pd.read_excel(excel_file, sheet_name="Plan")
             self.bom_df = pd.read_excel(excel_file, sheet_name="BOM")
             
-            st.success("✅ تم تحميل البيانات بنجاح")
+            # تحميل شيت MRP Contor إذا كان موجوداً (اختياري)
+            if "MRP Contor" in excel_file.sheet_names:
+                self.mrp_control_df = pd.read_excel(excel_file, sheet_name="MRP Contor")
+                st.success("✅ تم تحميل البيانات بنجاح (بما في ذلك MRP Contor)")
+            else:
+                st.success("✅ تم تحميل البيانات بنجاح (بدون MRP Contor)")
+                st.info("ℹ️ لم يتم العثور على شيت 'MRP Contor' - سيتم المتابعة بدونه")
+            
             return True
             
         except Exception as e:
             st.error(f"❌ خطأ في تحميل الملف: {e}")
             return False
+
+    def prepare_mrp_control_data(self):
+        """تحضير بيانات MRP Contor"""
+        if self.mrp_control_df is None:
+            return True  # المتابعة بدون MRP Contor
+            
+        try:
+            # تنظيف أعمدة MRP Contor
+            self.mrp_control_df.columns = [str(c).strip() for c in self.mrp_control_df.columns]
+            
+            # البحث عن أعمدة MRP Contor
+            cols_lower = {str(c).lower(): c for c in self.mrp_control_df.columns}
+            
+            def find_col(*names):
+                for n in names:
+                    if n.lower() in cols_lower:
+                        return cols_lower[n.lower()]
+                return None
+
+            col_material = find_col("material", "code", "component", "item code", "raw_material")
+            col_description = find_col("description", "material description", "item description", "component_description")
+            col_mrp_control = find_col("mrp contor", "mrp control", "mrp", "control", "controller")
+            
+            if not col_material:
+                st.warning("⚠️ عمود الأكواد غير موجود في شيت MRP Contor - سيتم تجاهل الشيت")
+                return True
+                
+            if not col_mrp_control:
+                st.warning("⚠️ عمود MRP Contor غير موجود في شيت MRP Contor - سيتم تجاهل الشيت")
+                return True
+            
+            # بناء قاموس قيم MRP Contor
+            mrp_control_count = 0
+            for _, row in self.mrp_control_df.iterrows():
+                material_code = str(row[col_material]).strip()
+                if material_code and material_code != 'nan' and material_code != '':
+                    # تخزين قيمة MRP Contor
+                    mrp_control_value = row[col_mrp_control]
+                    if pd.notna(mrp_control_value):
+                        self.mrp_control_values[material_code] = str(mrp_control_value).strip()
+                        mrp_control_count += 1
+                    
+                    # أيضا تخزين الوصف إذا كان متوفرا
+                    if col_description and pd.notna(row[col_description]):
+                        description = str(row[col_description]).strip()
+                        if description and description != '':
+                            # الأولوية لأوصاف MRP Contor
+                            self.material_descriptions[material_code] = description
+            
+            st.info(f"✅ تم تحميل {mrp_control_count} قيمة MRP Contor")
+            return True
+            
+        except Exception as e:
+            st.warning(f"⚠️ خطأ في تحضير بيانات MRP Contor: {e} - سيتم المتابعة بدونه")
+            return True
+
+    def get_mrp_control_value(self, material_code: str) -> str:
+        """Get MRP Contor value for material code"""
+        return self.mrp_control_values.get(material_code, "")
 
     def prepare_bom_columns(self) -> tuple:
         """Identify and validate BOM columns"""
@@ -124,10 +192,10 @@ class MRPCalculator:
             for _, row in self.bom_df.iterrows():
                 material_code = str(row[col_component]).strip()
                 
-                # تخزين الوصف
+                # تخزين الوصف من BOM (إذا لم يكن موجوداً في MRP Contor)
                 if col_component_description and pd.notna(row[col_component_description]):
                     description = str(row[col_component_description]).strip()
-                    if material_code and description and material_code != 'nan':
+                    if material_code and description and material_code != 'nan' and material_code not in self.material_descriptions:
                         self.material_descriptions[material_code] = description
                 
                 # تخزين وحدة القياس الأصلية
@@ -143,7 +211,7 @@ class MRPCalculator:
                 parent_code = str(row[col_parent]).strip()
                 if col_component_description and pd.notna(row[col_component_description]):
                     parent_desc = str(row[col_component_description]).strip()
-                    if parent_code and parent_desc and parent_code != 'nan':
+                    if parent_code and parent_desc and parent_code != 'nan' and parent_code not in self.material_descriptions:
                         self.material_descriptions[parent_code] = parent_desc
                 
                 if col_uom and pd.notna(row[col_uom]):
@@ -199,7 +267,6 @@ class MRPCalculator:
             st.error(f"❌ خطأ في بناء علاقات BOM: {e}")
             return False
 
-    # ... باقي الدوال كما هي بدون تغيير
     def get_material_description(self, material_code: str) -> str:
         """Get description for material code, return empty if not found"""
         return self.material_descriptions.get(material_code, "")
@@ -277,15 +344,17 @@ class MRPCalculator:
         # Create output DataFrame with descriptions and STANDARDIZED UoM
         raw_list = sorted(material_codes)
         
-        # إضافة أعمدة الوصف ووحدة القياس الموحدة
+        # إضافة أعمدة الوصف ووحدة القياس الموحدة و MRP Contor
         descriptions = [self.get_material_description(material) for material in raw_list]
         standardized_uoms = [self.get_standardized_uom(material) for material in raw_list]
+        mrp_controls = [self.get_mrp_control_value(material) for material in raw_list]
         
         # إنشاء DataFrame النهائي
         out_df = pd.DataFrame({
             'Raw_Material': raw_list,
             'Component_Description': descriptions,
-            'UoM': standardized_uoms  # استخدام الوحدة الموحدة
+            'UoM': standardized_uoms,  # استخدام الوحدة الموحدة
+            'MRP_Contor': mrp_controls  # إضافة عمود MRP Contor
         })
         
         # إضافة أعمدة الشهور
@@ -301,9 +370,9 @@ class MRPCalculator:
         st.header("📁 رفع ملف الخطة")
         
         uploaded_file = st.file_uploader(
-            "اختر ملف Excel الذي يحتوي على شيت Plan وBOM",
+            "اختر ملف Excel الذي يحتوي على شيت Plan وBOM (واختياري: MRP Contor)",
             type=["xlsx", "xls"],
-            help="يجب أن يحتوي الملف على شيتين: 'Plan' و 'BOM'"
+            help="يجب أن يحتوي الملف على شيتين: 'Plan' و 'BOM' - واختياري: 'MRP Contor'"
         )
         
         if uploaded_file is not None:
@@ -313,15 +382,34 @@ class MRPCalculator:
                     return
                 
                 # Show data preview
-                col1, col2 = st.columns(2)
+                if self.mrp_control_df is not None:
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.subheader("معاينة بيانات الخطة (Plan)")
+                        st.dataframe(self.plan_df.head(), use_container_width=True)
+                    
+                    with col2:
+                        st.subheader("معاينة بيانات BOM")
+                        st.dataframe(self.bom_df.head(), use_container_width=True)
+                    
+                    with col3:
+                        st.subheader("معاينة بيانات MRP Contor")
+                        st.dataframe(self.mrp_control_df.head(), use_container_width=True)
+                else:
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader("معاينة بيانات الخطة (Plan)")
+                        st.dataframe(self.plan_df.head(), use_container_width=True)
+                    
+                    with col2:
+                        st.subheader("معاينة بيانات BOM")
+                        st.dataframe(self.bom_df.head(), use_container_width=True)
                 
-                with col1:
-                    st.subheader("معاينة بيانات الخطة (Plan)")
-                    st.dataframe(self.plan_df.head(), use_container_width=True)
-                
-                with col2:
-                    st.subheader("معاينة بيانات BOM")
-                    st.dataframe(self.bom_df.head(), use_container_width=True)
+                # Process MRP Control data first
+                if not self.prepare_mrp_control_data():
+                    return
                 
                 # Process BOM
                 col_parent, col_component, col_qty, col_component_description, col_uom = self.prepare_bom_columns()
@@ -333,17 +421,19 @@ class MRPCalculator:
                 
                 # Show material info sample
                 if self.material_descriptions or self.material_uoms:
-                    st.subheader("📝 عينة من بيانات المواد (قبل التحويل)")
+                    st.subheader("📝 عينة من بيانات المواد")
                     sample_data = []
                     materials = list(self.material_descriptions.keys())[:10]
                     for material in materials:
                         original_uom = self.material_uoms.get(material, '')
                         standardized_uom = self.get_standardized_uom(material)
+                        mrp_control = self.get_mrp_control_value(material)
                         sample_data.append({
                             'كود المادة': material,
                             'وصف المكون': self.material_descriptions.get(material, ''),
                             'الوحدة الأصلية': original_uom,
-                            'الوحدة الموحدة': standardized_uom
+                            'الوحدة الموحدة': standardized_uom,
+                            'MRP Contor': mrp_control
                         })
                     if sample_data:
                         sample_df = pd.DataFrame(sample_data)
@@ -361,7 +451,7 @@ class MRPCalculator:
                     st.header("📊 نتائج متطلبات المواد")
                     
                     # إحصائيات سريعة
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.metric("عدد المواد الخام", len(requirements_df))
                     with col2:
@@ -370,6 +460,9 @@ class MRPCalculator:
                     with col3:
                         kg_materials = (requirements_df['UoM'] == 'KG').sum()
                         st.metric("المواد بالكيلوجرام", kg_materials)
+                    with col4:
+                        materials_with_mrp = (requirements_df['MRP_Contor'] != '').sum()
+                        st.metric("مواد ذات MRP Contor", f"{materials_with_mrp}/{len(requirements_df)}")
                     
                     # عرض البيانات مع التنسيق
                     st.dataframe(requirements_df, use_container_width=True)
@@ -386,6 +479,8 @@ class MRPCalculator:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             self.plan_df.to_excel(writer, sheet_name="Plan", index=False)
             self.bom_df.to_excel(writer, sheet_name="BOM", index=False)
+            if self.mrp_control_df is not None:
+                self.mrp_control_df.to_excel(writer, sheet_name="MRP_Contor", index=False)
             requirements_df.to_excel(writer, sheet_name="RawMaterial_Requirements", index=False)
         
         output.seek(0)
@@ -398,6 +493,7 @@ class MRPCalculator:
             type="primary"
         )
         st.balloons()
+
 # Run the application
 if __name__ == "__main__":
     calculator = MRPCalculator()
