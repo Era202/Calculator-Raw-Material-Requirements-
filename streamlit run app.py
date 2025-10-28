@@ -27,6 +27,7 @@ class MRPCalculator:
         self.standardized_uoms = {}  # تخزين الوحدات الموحدة
         self.mrp_control_values = {}  # تخزين قيم MRP Contor
         self.manufacturing_quantities = {}  # كميات التصنيع للمكونات الوسيطة
+        self.bom_hierarchy = {}  # تخزين هيكل الـ BOM
         
     def load_data(self, uploaded_file) -> bool:
         """Load Plan, BOM and MRP Control sheets from uploaded Excel file"""
@@ -389,71 +390,130 @@ class MRPCalculator:
             st.warning(f"⚠️ خطأ في حساب كميات التصنيع: {e}")
             return False
 
-    def generate_bom_level1_sheet(self):
-        """إنشاء شيت للمكونات الموجودة في المستوى الأول فقط مع الكميات المطلوبة حسب التاريخ"""
+    def calculate_all_levels_requirements(self):
+        """حساب الكميات المطلوبة لجميع مستويات الـ BOM"""
         try:
             # تحديد أعمدة الشهور من الخطة
             month_cols = self.plan_df.columns[2:] if "Material Description" in self.plan_df.columns else self.plan_df.columns[1:]
             
-            # تحديد المكونات في المستوى الأول (التي تظهر كأبناء للمواد في الخطة)
-            plan_materials = set(self.plan_df.iloc[:, 0].astype(str).str.strip())
-            level1_components = set()
+            # نتائج جميع المستويات
+            all_levels_results = defaultdict(lambda: defaultdict(float))
             
-            # جمع جميع المكونات من المستوى الأول
-            for parent in plan_materials:
-                if parent in self.relations:
-                    for comp, qty in self.relations[parent]:
-                        level1_components.add(comp)
-            
-            # حساب الكميات المطلوبة لكل مكون حسب التاريخ
-            component_requirements = defaultdict(lambda: defaultdict(float))
-            
+            # معالجة كل مادة في الخطة
             for _, row in self.plan_df.iterrows():
                 parent = str(row.iloc[0]).strip()
-                if not parent or parent not in self.relations:
+                if not parent:
                     continue
-                    
-                # الحصول على مكونات المستوى الأول لهذا الأب
-                for comp, comp_qty in self.relations[parent]:
-                    for month in month_cols:
-                        try:
-                            planned_qty = row[month]
-                            if pd.isna(planned_qty):
-                                continue
-                            planned = float(str(planned_qty).replace(",", "."))
-                            if planned > 0:
-                                component_requirements[comp][month] += planned * comp_qty
-                        except (ValueError, TypeError):
+                
+                # حساب الكميات لكل شهر
+                for month in month_cols:
+                    try:
+                        planned_qty = row[month]
+                        if pd.isna(planned_qty) or planned_qty == 0:
                             continue
+                        planned = float(str(planned_qty).replace(",", "."))
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    # إضافة المادة الأصلية (المستوى 0)
+                    all_levels_results[parent][month] += planned
+                    
+                    # حساب الكميات لجميع المستويات باستخدام BOM
+                    self._calculate_component_requirements(parent, planned, month, all_levels_results)
             
-            # إنشاء DataFrame للمستوى الأول مع الكميات
-            level1_data = []
-            for comp in sorted(level1_components):
+            # إنشاء DataFrame لجميع المستويات
+            all_materials = sorted(all_levels_results.keys())
+            
+            all_levels_data = []
+            for material in all_materials:
                 row_data = {
-                    'Component_Code': comp,
-                    'Component_Description': self.get_material_description(comp),
-                    'Standardized_UoM': self.get_standardized_uom(comp),
-                    'MRP_Contor': self.get_mrp_control_value(comp),
-                    'Is_Raw_Material': comp.startswith("1") or comp not in self.relations or not self.relations[comp],
-                    'Total_Required': sum(component_requirements[comp].values())
+                    'Material_Code': material,
+                    'Material_Description': self.get_material_description(material),
+                    'Standardized_UoM': self.get_standardized_uom(material),
+                    'MRP_Contor': self.get_mrp_control_value(material),
+                    'Level': self._get_material_level(material),
+                    'Is_Raw_Material': material.startswith("1") or material not in self.relations or not self.relations[material],
+                    'Total_Required': sum(all_levels_results[material].values())
                 }
                 
                 # إضافة الكميات لكل شهر
                 for month in month_cols:
-                    row_data[str(month)] = component_requirements[comp].get(month, 0.0)
+                    row_data[str(month)] = all_levels_results[material].get(month, 0.0)
                 
-                level1_data.append(row_data)
+                all_levels_data.append(row_data)
             
-            level1_df = pd.DataFrame(level1_data)
+            all_levels_df = pd.DataFrame(all_levels_data)
             
-            # إعادة ترتيب الأعمدة لجعل الكميات الشهرية بعد الأعمدة الأساسية
-            base_cols = ['Component_Code', 'Component_Description', 'Standardized_UoM', 'MRP_Contor', 'Is_Raw_Material', 'Total_Required']
+            # إعادة ترتيب الأعمدة
+            base_cols = ['Material_Code', 'Material_Description', 'Standardized_UoM', 'MRP_Contor', 'Level', 'Is_Raw_Material', 'Total_Required']
             month_cols_sorted = [str(col) for col in month_cols]
             all_cols = base_cols + month_cols_sorted
             
-            level1_df = level1_df[all_cols]
+            all_levels_df = all_levels_df[all_cols]
+            all_levels_df = all_levels_df.sort_values(['Level', 'Material_Code'])
             
-            st.info(f"✅ تم تحديد {len(level1_df)} مكون في المستوى الأول مع الكميات المطلوبة")
+            st.info(f"✅ تم حساب الكميات لـ {len(all_levels_df)} مادة في جميع مستويات الـ BOM")
+            return all_levels_df
+            
+        except Exception as e:
+            st.error(f"❌ خطأ في حساب جميع المستويات: {e}")
+            return pd.DataFrame()
+
+    def _calculate_component_requirements(self, parent, parent_qty, month, results_dict):
+        """دالة مساعدة لحساب متطلبات المكونات بشكل متكرر"""
+        if parent not in self.relations:
+            return
+        
+        for comp, comp_qty in self.relations[parent]:
+            required_qty = parent_qty * comp_qty
+            results_dict[comp][month] += required_qty
+            # استدعاء متكرر للمكونات التالية
+            self._calculate_component_requirements(comp, required_qty, month, results_dict)
+
+    def _get_material_level(self, material_code):
+        """تحديد مستوى المادة في هيكل الـ BOM"""
+        # المواد في الخطة هي المستوى 0
+        if material_code in set(self.plan_df.iloc[:, 0].astype(str).str.strip()):
+            return 0
+        
+        # البحث عن المستوى في العلاقات
+        def find_level(current_material, visited=None):
+            if visited is None:
+                visited = set()
+            
+            if current_material in visited:
+                return -1  # منع التكرار اللانهائي
+            visited.add(current_material)
+            
+            # إذا كانت المادة موجودة في الخطة، فهي المستوى 0
+            if current_material in set(self.plan_df.iloc[:, 0].astype(str).str.strip()):
+                return 1
+            
+            # البحث عن الآباء
+            for parent, components in self.relations.items():
+                for comp, _ in components:
+                    if comp == current_material:
+                        parent_level = find_level(parent, visited)
+                        if parent_level >= 0:
+                            return parent_level + 1
+            
+            return -1  # لم يتم العثور على مسار إلى الخطة
+        
+        level = find_level(material_code)
+        return level if level >= 0 else 999  # مستوى عالي إذا لم يتم العثور على مسار
+
+    def generate_bom_level1_sheet(self):
+        """إنشاء شيت للمكونات الموجودة في المستوى الأول فقط مع الكميات المطلوبة حسب التاريخ"""
+        try:
+            # استخدام دالة حساب جميع المستويات ثم تصفية المستوى الأول فقط
+            all_levels_df = self.calculate_all_levels_requirements()
+            if all_levels_df.empty:
+                return pd.DataFrame()
+            
+            # تصفية المستوى الأول فقط (Level = 1)
+            level1_df = all_levels_df[all_levels_df['Level'] == 1].copy()
+            
+            st.info(f"✅ تم تحديد {len(level1_df)} مكون في المستوى الأول")
             return level1_df
             
         except Exception as e:
@@ -613,6 +673,7 @@ class MRPCalculator:
                 if st.button("🚀 حساب متطلبات المواد", type="primary"):
                     with st.spinner("جاري حساب متطلبات المواد..."):
                         requirements_df = self.calculate_requirements()
+                        all_levels_df = self.calculate_all_levels_requirements()
                         level1_df = self.generate_bom_level1_sheet()
                         monthly_summary = self.create_monthly_summary()
                     
@@ -637,24 +698,33 @@ class MRPCalculator:
                     st.subheader("متطلبات المواد الخام")
                     st.dataframe(requirements_df, use_container_width=True)
                     
+                    # عرض جميع مستويات الـ BOM
+                    if not all_levels_df.empty:
+                        st.subheader("🏗️ جميع مستويات الـ BOM مع الكميات المطلوبة")
+                        
+                        # إحصائيات سريعة لجميع المستويات
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("إجمالي المواد", len(all_levels_df))
+                        with col2:
+                            total_all_levels = all_levels_df['Total_Required'].sum()
+                            st.metric("إجمالي الكميات", f"{total_all_levels:,.0f}")
+                        with col3:
+                            max_level = all_levels_df['Level'].max()
+                            st.metric("أعلى مستوى", max_level)
+                        with col4:
+                            raw_count = all_levels_df['Is_Raw_Material'].sum()
+                            st.metric("مواد خام", f"{raw_count}/{len(all_levels_df)}")
+                        
+                        # عرض حسب المستويات
+                        for level in sorted(all_levels_df['Level'].unique()):
+                            level_data = all_levels_df[all_levels_df['Level'] == level]
+                            st.subheader(f"📋 المستوى {level} ({len(level_data)} مادة)")
+                            st.dataframe(level_data, use_container_width=True)
+                    
                     # عرض مكونات المستوى الأول مع الكميات
                     if not level1_df.empty:
                         st.subheader("📋 المكونات في المستوى الأول مع الكميات المطلوبة")
-                        
-                        # إحصائيات سريعة للمستوى الأول
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("عدد المكونات", len(level1_df))
-                        with col2:
-                            total_level1 = level1_df['Total_Required'].sum()
-                            st.metric("إجمالي الكميات", f"{total_level1:,.0f}")
-                        with col3:
-                            raw_materials = level1_df['Is_Raw_Material'].sum()
-                            st.metric("مواد خام", raw_materials)
-                        with col4:
-                            manufactured = len(level1_df) - raw_materials
-                            st.metric("مكونات مصنعة", manufactured)
-                        
                         st.dataframe(level1_df, use_container_width=True)
                     
                     # عرض الملخص الشهري
@@ -696,12 +766,12 @@ class MRPCalculator:
                         st.plotly_chart(fig, use_container_width=True)
                     
                     # تحميل النتائج
-                    self.download_results(requirements_df, level1_df, monthly_summary)
+                    self.download_results(requirements_df, all_levels_df, level1_df, monthly_summary)
                     
             except Exception as e:
                 st.error(f"❌ حدث خطأ غير متوقع: {e}")
 
-    def download_results(self, requirements_df, level1_df, monthly_summary):
+    def download_results(self, requirements_df, all_levels_df, level1_df, monthly_summary):
         """Handle downloading results"""
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -712,6 +782,8 @@ class MRPCalculator:
             requirements_df.to_excel(writer, sheet_name="RawMaterial_Requirements", index=False)
             
             # إضافة الشيتات الجديدة
+            if not all_levels_df.empty:
+                all_levels_df.to_excel(writer, sheet_name="All_BOM_Levels", index=False)
             if not level1_df.empty:
                 level1_df.to_excel(writer, sheet_name="Level1_Components", index=False)
             if not monthly_summary.empty:
