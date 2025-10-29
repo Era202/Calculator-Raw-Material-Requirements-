@@ -837,8 +837,8 @@ class MRPCalculator:
                 manuf_df.to_excel(writer, sheet_name="Manufacturing_Quantities", index=False)
 
             # إضافة الشيتات الجديدة
-            if not all_levels_df.empty:
-                all_levels_df.to_excel(writer, sheet_name="All_Materials", index=False)
+         #   if not all_levels_df.empty:
+          #      all_levels_df.to_excel(writer, sheet_name="All_Materials", index=False)
             if not monthly_summary.empty:
                 monthly_summary.to_excel(writer, sheet_name="Monthly_Summary", index=False)
 
